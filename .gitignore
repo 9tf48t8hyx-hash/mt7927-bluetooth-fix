@@ -1,0 +1,10 @@
+_build/
+*.zip
+*.tar.xz
+*.ko
+*.o
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+.module-common.o
