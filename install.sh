@@ -1,19 +1,18 @@
 #!/bin/bash
-# mt7927-bluetooth-fix — One-shot installer for MediaTek MT7927/MT6639 Bluetooth on Fedora
-# Fixes Bluetooth on motherboards using the MediaTek Filogic 380 (MT7927) combo chip,
-# where the BT controller (MT6639) connects via USB but is not recognized by the
-# upstream btusb/btmtk kernel drivers.
+# mt7927-fix — One-shot DKMS installer for MediaTek MT7927 WiFi & Bluetooth on Linux
 #
-# Tested on: Fedora 43 (kernel 6.19.x), ASUS ROG Strix X870-I Gaming WiFi
-# Should work on: Fedora 41+, kernel 6.12+, any board with MT7927 BT (13d3:3588 and others)
+# Fixes both WiFi (PCIe mt7925e) and Bluetooth (USB btusb/btmtk) for the
+# MediaTek Filogic 380 (MT7927/MT6639) combo chip found on recent AM5 boards.
 #
 # Usage: sudo ./install.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DKMS_NAME="mediatek-mt7927"
+DKMS_VER="2.4"
+BUILDDIR="$SCRIPT_DIR/_build"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -23,61 +22,39 @@ info()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[✗]${NC} $*" >&2; }
 
-# ── Pre-flight checks ──────────────────────────────────────────────
-
 if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root (sudo ./install.sh)"
+    error "This script must be run as root: sudo ./install.sh"
     exit 1
 fi
 
 KVER=$(uname -r)
+KMAJOR="${KVER%%.*}"
+KBASE="${KVER%%-*}"
 info "Kernel: $KVER"
 
-# Verify the BT device is present
-if ! lsusb 2>/dev/null | grep -qiE "13d3:3588|0489:e13a|0489:e0fa|0489:e10f|0489:e110|0489:e116"; then
-    error "No known MT7927/MT6639 Bluetooth USB device found."
-    echo "  This fix targets devices with the following USB IDs:"
-    echo "    13d3:3588 (IMC Networks / ASUS)"
-    echo "    0489:e13a, 0489:e0fa, 0489:e10f, 0489:e110, 0489:e116 (Foxconn)"
-    echo ""
-    echo "  Your USB Bluetooth devices:"
-    lsusb | grep -iE "bluetooth|wireless" || echo "    (none found)"
-    exit 1
-fi
-
-BT_USB_ID=$(lsusb | grep -oiE "(13d3:3588|0489:e13a|0489:e0fa|0489:e10f|0489:e110|0489:e116)" | head -1)
-info "Found MT7927 BT device: $BT_USB_ID"
-
-# ── Step 1: Install dependencies ───────────────────────────────────
+# ── Step 1: Dependencies ──────────────────────────────────────────
 
 info "Installing build dependencies..."
 if command -v dnf &>/dev/null; then
-    dnf install -y gcc kernel-devel-"$KVER" curl xz python3 2>&1 | tail -3
+    dnf install -y gcc kernel-devel-"$KVER" dkms curl xz python3 2>&1 | tail -3
 elif command -v apt-get &>/dev/null; then
     apt-get update -qq
-    apt-get install -y gcc linux-headers-"$KVER" curl xz-utils python3 2>&1 | tail -3
+    apt-get install -y gcc linux-headers-"$KVER" dkms curl xz-utils python3 2>&1 | tail -3
 else
-    error "Unsupported package manager. Install gcc, kernel-devel, curl, xz, python3 manually."
+    error "Unsupported package manager. Install gcc, kernel-devel, dkms, curl, xz, python3."
     exit 1
 fi
 
 KSRC="/usr/src/kernels/$KVER"
-if [[ ! -d "$KSRC" ]]; then
-    KSRC="/lib/modules/$KVER/build"
-fi
+[[ ! -d "$KSRC" ]] && KSRC="/lib/modules/$KVER/build"
 if [[ ! -d "$KSRC" ]]; then
     error "Kernel headers not found for $KVER"
     exit 1
 fi
-info "Kernel headers: $KSRC"
 
-# ── Step 2: Download kernel source (bluetooth driver only) ─────────
+# ── Step 2: Download kernel source ────────────────────────────────
 
-KMAJOR="${KVER%%.*}"
-KBASE="${KVER%%-*}"
 TARBALL="linux-${KBASE}.tar.xz"
-BUILDDIR="$SCRIPT_DIR/_build"
-
 mkdir -p "$BUILDDIR"
 
 if [[ ! -f "$BUILDDIR/$TARBALL" ]]; then
@@ -87,6 +64,8 @@ if [[ ! -f "$BUILDDIR/$TARBALL" ]]; then
 fi
 info "Kernel tarball: $(du -h "$BUILDDIR/$TARBALL" | cut -f1)"
 
+# ── Step 3: Extract driver sources ────────────────────────────────
+
 info "Extracting bluetooth driver sources..."
 rm -rf "$BUILDDIR/bluetooth"
 mkdir -p "$BUILDDIR/bluetooth"
@@ -95,108 +74,147 @@ tar -xf "$BUILDDIR/$TARBALL" \
     -C "$BUILDDIR/bluetooth" \
     "linux-${KBASE}/drivers/bluetooth"
 
-# ── Step 3: Apply MT6639 patch ─────────────────────────────────────
+info "Extracting mt76 WiFi driver sources..."
+rm -rf "$BUILDDIR/mt76"
+mkdir -p "$BUILDDIR/mt76"
+tar -xf "$BUILDDIR/$TARBALL" \
+    --strip-components=6 \
+    -C "$BUILDDIR/mt76" \
+    "linux-${KBASE}/drivers/net/wireless/mediatek/mt76"
 
-info "Applying MT6639 Bluetooth patch..."
-cd "$BUILDDIR/bluetooth"
-patch -p3 < "$SCRIPT_DIR/mt6639-bt.patch"
+# ── Step 4: Apply patches ─────────────────────────────────────────
 
-# ── Step 4: Build modules ─────────────────────────────────────────
+info "Applying Bluetooth MT6639 patch..."
+patch -d "$BUILDDIR/bluetooth" -p3 < "$SCRIPT_DIR/mt6639-bt.patch"
+cp "$SCRIPT_DIR/bluetooth.Makefile" "$BUILDDIR/bluetooth/Makefile"
 
-info "Compiling btusb and btmtk modules..."
-cat > Makefile <<'MKEOF'
-obj-m += btusb.o
-obj-m += btmtk.o
-MKEOF
+info "Applying WiFi MT7927 patches..."
+patch -d "$BUILDDIR/mt76" -p1 < "$SCRIPT_DIR/mt7902-wifi-6.19.patch"
+for p in "$SCRIPT_DIR"/mt7927-wifi-*.patch; do
+    echo "  $(basename "$p")"
+    patch -d "$BUILDDIR/mt76" -p1 < "$p"
+done
 
-make -C "$KSRC" M="$(pwd)" modules 2>&1 | grep -E "^(  CC|  LD|  BTF|ERROR|make)" || true
+# Install Kbuild files
+cp "$SCRIPT_DIR/mt76.Kbuild"   "$BUILDDIR/mt76/Kbuild"
+cp "$SCRIPT_DIR/mt7921.Kbuild" "$BUILDDIR/mt76/mt7921/Kbuild"
+cp "$SCRIPT_DIR/mt7925.Kbuild" "$BUILDDIR/mt76/mt7925/Kbuild"
 
-if [[ ! -f btusb.ko ]] || [[ ! -f btmtk.ko ]]; then
-    error "Module compilation failed."
-    exit 1
-fi
-info "Modules built successfully"
+# ── Step 5: Download and extract firmware ─────────────────────────
 
-# ── Step 5: Download and extract firmware ──────────────────────────
+FW_BT="/lib/firmware/mediatek/mt6639/BT_RAM_CODE_MT6639_2_1_hdr.bin"
+FW_WIFI="/lib/firmware/mediatek/mt7927/WIFI_RAM_CODE_MT6639_2_1.bin"
 
-if [[ ! -f /lib/firmware/mediatek/mt6639/BT_RAM_CODE_MT6639_2_1_hdr.bin ]]; then
-    info "Downloading MediaTek driver package (for firmware extraction)..."
+if [[ ! -f "$FW_BT" ]] || [[ ! -f "$FW_WIFI" ]]; then
+    info "Downloading MediaTek driver package (for firmware)..."
     cd "$SCRIPT_DIR"
     bash download-driver.sh "$BUILDDIR"
 
-    info "Extracting MT6639 Bluetooth firmware..."
+    info "Extracting firmware..."
     DRIVER_ZIP=$(ls "$BUILDDIR"/DRV_WiFi_MTK_MT7925_MT7927*.zip 2>/dev/null | head -1)
     if [[ -z "$DRIVER_ZIP" ]]; then
-        error "Driver ZIP not found after download."
+        error "Driver ZIP not found."
         exit 1
     fi
-
     mkdir -p "$BUILDDIR/firmware"
     python3 "$SCRIPT_DIR/extract_firmware.py" "$DRIVER_ZIP" "$BUILDDIR/firmware"
 
-    mkdir -p /lib/firmware/mediatek/mt6639
-    cp "$BUILDDIR/firmware/BT_RAM_CODE_MT6639_2_1_hdr.bin" \
-       /lib/firmware/mediatek/mt6639/
-    info "Firmware installed: /lib/firmware/mediatek/mt6639/"
+    # Install firmware
+    mkdir -p /lib/firmware/mediatek/mt6639 /lib/firmware/mediatek/mt7927
+    # Also install to /usr/lib/firmware if it exists (Fedora uses both)
+    for fwdir in /lib/firmware /usr/lib/firmware; do
+        if [[ -d "$fwdir" ]]; then
+            mkdir -p "$fwdir/mediatek/mt6639" "$fwdir/mediatek/mt7927"
+            cp "$BUILDDIR/firmware/BT_RAM_CODE_MT6639_2_1_hdr.bin" "$fwdir/mediatek/mt6639/"
+            cp "$BUILDDIR/firmware/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin" "$fwdir/mediatek/mt7927/"
+            cp "$BUILDDIR/firmware/WIFI_RAM_CODE_MT6639_2_1.bin" "$fwdir/mediatek/mt7927/"
+        fi
+    done
+    info "Firmware installed"
 else
     info "Firmware already installed, skipping"
 fi
 
-# ── Step 6: Install modules ───────────────────────────────────────
+# ── Step 6: Install DKMS ──────────────────────────────────────────
 
-MODDIR="/lib/modules/$KVER/kernel/drivers/bluetooth"
-cd "$BUILDDIR/bluetooth"
+DKMS_SRC="/usr/src/${DKMS_NAME}-${DKMS_VER}"
 
-# Backup originals (only if not already backed up)
-for mod in btusb btmtk; do
-    if [[ -f "$MODDIR/${mod}.ko.xz" ]] && [[ ! -f "$MODDIR/${mod}.ko.xz.orig" ]]; then
-        cp "$MODDIR/${mod}.ko.xz" "$MODDIR/${mod}.ko.xz.orig"
-    fi
-done
-info "Original modules backed up (.orig)"
+info "Installing DKMS source tree..."
 
-# Install patched modules
-for mod in btusb btmtk; do
-    rm -f "$MODDIR/${mod}.ko.xz" "$MODDIR/${mod}.ko.zst"
-    xz -C crc32 -T0 "${mod}.ko" -c > "$MODDIR/${mod}.ko.xz"
-done
-depmod -a "$KVER"
-info "Patched modules installed"
+# Remove previous DKMS version if present
+dkms status "$DKMS_NAME/$DKMS_VER" 2>/dev/null | grep -q "$DKMS_NAME" && \
+    dkms remove "$DKMS_NAME/$DKMS_VER" --all 2>/dev/null || true
 
-# ── Step 7: Load and activate ─────────────────────────────────────
+rm -rf "$DKMS_SRC"
+mkdir -p "$DKMS_SRC/drivers/bluetooth" "$DKMS_SRC/mt76/mt7921" "$DKMS_SRC/mt76/mt7925"
 
-info "Loading patched modules..."
+# Copy DKMS config
+cp "$SCRIPT_DIR/dkms.conf" "$DKMS_SRC/"
+
+# Copy patched sources
+cp "$BUILDDIR"/bluetooth/*.c "$BUILDDIR"/bluetooth/*.h "$DKMS_SRC/drivers/bluetooth/"
+cp "$BUILDDIR/bluetooth/Makefile" "$DKMS_SRC/drivers/bluetooth/"
+cp "$BUILDDIR"/mt76/*.c "$BUILDDIR"/mt76/*.h "$DKMS_SRC/mt76/"
+cp "$BUILDDIR/mt76/Kbuild" "$DKMS_SRC/mt76/"
+cp "$BUILDDIR"/mt76/mt7921/*.c "$BUILDDIR"/mt76/mt7921/*.h "$DKMS_SRC/mt76/mt7921/"
+cp "$BUILDDIR/mt76/mt7921/Kbuild" "$DKMS_SRC/mt76/mt7921/"
+cp "$BUILDDIR"/mt76/mt7925/*.c "$BUILDDIR"/mt76/mt7925/*.h "$DKMS_SRC/mt76/mt7925/"
+cp "$BUILDDIR/mt76/mt7925/Kbuild" "$DKMS_SRC/mt76/mt7925/"
+
+info "Building and installing DKMS modules..."
+dkms add "$DKMS_NAME/$DKMS_VER" 2>/dev/null || true
+dkms build "$DKMS_NAME/$DKMS_VER" -k "$KVER"
+dkms install "$DKMS_NAME/$DKMS_VER" -k "$KVER" --force
+
+# ── Step 7: Load modules and activate ─────────────────────────────
+
+info "Loading modules..."
+
+# Reload BT
 rmmod btusb btmtk 2>/dev/null || true
 sleep 1
 modprobe btmtk
 modprobe btusb
-sleep 15
+sleep 5
 
+# Load WiFi
+modprobe mt7925e 2>/dev/null || true
+sleep 3
+
+# Activate Bluetooth
 rfkill unblock bluetooth 2>/dev/null || true
-bluetoothctl power on 2>/dev/null || true
-sleep 2
+if command -v bluetoothctl &>/dev/null; then
+    bluetoothctl power on 2>/dev/null || true
+fi
 
-# Enable auto-power at boot
+# Auto-enable BT at boot
 if [[ -f /etc/bluetooth/main.conf ]]; then
     sed -i 's/^#\?AutoEnable=.*/AutoEnable=true/' /etc/bluetooth/main.conf
 fi
 
-# ── Verify ────────────────────────────────────────────────────────
+# ── Result ────────────────────────────────────────────────────────
 
 echo ""
-if bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
-    info "Bluetooth is UP and running!"
-    bluetoothctl show 2>/dev/null | grep -E "Controller|Name|Powered" | head -3
+info "Installation complete!"
+echo ""
+
+# WiFi status
+WIFI_IF=$(ip -o link show | grep -oP 'wl\S+(?=:)' | head -1)
+if [[ -n "$WIFI_IF" ]]; then
+    info "WiFi interface: $WIFI_IF"
 else
-    warn "Bluetooth controller detected but not yet powered on."
-    warn "Try: rfkill unblock bluetooth && bluetoothctl power on"
+    warn "WiFi interface not yet visible. A reboot is recommended."
+fi
+
+# BT status
+if command -v bluetoothctl &>/dev/null && bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
+    info "Bluetooth is UP and running"
+    bluetoothctl show 2>/dev/null | grep -E "Controller|Name" | head -2
+else
+    warn "Bluetooth controller may need a reboot to fully initialize."
 fi
 
 echo ""
-info "Installation complete."
-echo ""
-echo "  Notes:"
-echo "    - Original modules saved as .orig in $MODDIR"
-echo "    - To restore: rename .orig back to .ko.xz and run depmod -a"
-echo "    - After a kernel update, re-run this script for the new kernel"
+echo "  A reboot is recommended for clean module loading."
+echo "  DKMS will automatically rebuild modules on kernel updates."
 echo ""

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Restore original btusb/btmtk modules and remove MT6639 firmware.
+# Remove MT7927 DKMS modules and firmware, restoring upstream drivers.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -7,31 +7,23 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-KVER=$(uname -r)
-MODDIR="/lib/modules/$KVER/kernel/drivers/bluetooth"
+DKMS_NAME="mediatek-mt7927"
+DKMS_VER="2.4"
 
-echo "[*] Restoring original modules for kernel $KVER..."
+echo "[*] Removing DKMS modules..."
+dkms remove "$DKMS_NAME/$DKMS_VER" --all 2>/dev/null || echo "    DKMS module not found"
+rm -rf "/usr/src/${DKMS_NAME}-${DKMS_VER}"
 
-for mod in btusb btmtk; do
-    if [[ -f "$MODDIR/${mod}.ko.xz.orig" ]]; then
-        mv "$MODDIR/${mod}.ko.xz.orig" "$MODDIR/${mod}.ko.xz"
-        echo "    Restored ${mod}.ko.xz"
-    else
-        echo "    No backup found for ${mod} — skipping"
-    fi
-done
-
-depmod -a "$KVER"
-
-echo "[*] Removing MT6639 firmware..."
+echo "[*] Removing MT6639/MT7927 firmware..."
 rm -rf /lib/firmware/mediatek/mt6639
-echo "    Done"
+rm -rf /lib/firmware/mediatek/mt7927
+rm -rf /usr/lib/firmware/mediatek/mt6639
+rm -rf /usr/lib/firmware/mediatek/mt7927
 
-echo "[*] Reloading original modules..."
-rmmod btusb btmtk 2>/dev/null || true
-sleep 1
-modprobe btusb 2>/dev/null || true
+echo "[*] Rebuilding module dependencies..."
+depmod -a "$(uname -r)"
 
 echo ""
-echo "[*] Uninstall complete. Bluetooth reverted to upstream drivers."
-echo "    A reboot is recommended."
+echo "[*] Uninstall complete."
+echo "    Reboot to load the upstream kernel modules."
+echo "    WiFi and Bluetooth will not work until upstream support is merged."

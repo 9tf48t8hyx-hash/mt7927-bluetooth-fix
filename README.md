@@ -1,20 +1,19 @@
-# MT7927 Bluetooth Fix for Linux
+# MT7927 WiFi & Bluetooth Fix for Linux
 
-Fix Bluetooth on motherboards using the **MediaTek Filogic 380 (MT7927)** combo WiFi/BT chip, where the Bluetooth controller (MT6639) is not recognized by the upstream Linux kernel.
+Fix **WiFi and Bluetooth** on motherboards using the **MediaTek Filogic 380 (MT7927)** combo chip, where neither WiFi (PCIe, chip ID `14c3:6639`) nor Bluetooth (USB, e.g. `13d3:3588`) are recognized by the upstream Linux kernel.
 
 ## The Problem
 
-Many recent AMD AM5 motherboards ship with the MediaTek MT7927 wireless chip. While WiFi typically works out of the box (the MT7925 PCIe driver handles it), **Bluetooth does not**. The BT side uses an internal MT6639 controller connected via USB, but:
+Many recent AMD AM5 motherboards ship with the MediaTek MT7927 wireless chip. The upstream kernel's `mt7925e` WiFi driver and `btusb`/`btmtk` Bluetooth drivers do not support the MT7927 variant:
 
-1. The USB device ID (e.g. `13d3:3588`) is missing from the kernel's `btusb` quirks table
-2. The `btmtk` driver does not know how to handle the MT6639 chip ID (`0x6639`)
-3. The MT6639 Bluetooth firmware is not included in the `linux-firmware` package
+**WiFi** — The PCIe device `14c3:6639` is not in the `mt7925e` driver's PCI ID table. No wireless interface is created. `lspci` shows the device but no driver is bound.
 
-This results in the infamous error in `dmesg`:
+**Bluetooth** — The USB device (e.g. `13d3:3588`) is caught by a generic `btusb` match, but the `BTUSB_MEDIATEK` quirk is missing, so firmware is never loaded. This produces:
 ```
 Bluetooth: hci0: Opcode 0x0c03 failed: -16
 ```
-And `bluetoothctl show` reports "No default controller available".
+
+**Firmware** — The MT6639 WiFi and Bluetooth firmware files are not included in the `linux-firmware` package.
 
 ## Affected Hardware
 
@@ -26,24 +25,29 @@ And `bluetoothctl show` reports "No default controller available".
 - ASUS ProArt X870E-Creator WiFi
 - Other AM5 boards with MediaTek MT7925/MT7927 wireless
 
-**USB Device IDs** handled by this fix:
-| USB ID | Vendor | Notes |
-|--------|--------|-------|
-| `13d3:3588` | IMC Networks (ASUS) | Most common |
-| `0489:e13a` | Foxconn | |
-| `0489:e0fa` | Foxconn | |
-| `0489:e10f` | Foxconn | |
-| `0489:e110` | Foxconn | |
-| `0489:e116` | Foxconn | |
+**Important:** These boards require the **external WiFi/BT antenna** screwed into the SMA connectors on the rear I/O panel. Without it, WiFi range is severely limited and Bluetooth is effectively non-functional.
 
-Check your device with:
+**Device IDs:**
+
+| Bus | ID | Description |
+|-----|----|-------------|
+| PCIe | `14c3:6639` | MT7927 WiFi |
+| USB | `13d3:3588` | MT6639 Bluetooth (IMC Networks / ASUS) |
+| USB | `0489:e13a` | MT6639 Bluetooth (Foxconn) |
+| USB | `0489:e0fa` | MT6639 Bluetooth (Foxconn) |
+| USB | `0489:e10f` | MT6639 Bluetooth (Foxconn) |
+| USB | `0489:e110` | MT6639 Bluetooth (Foxconn) |
+| USB | `0489:e116` | MT6639 Bluetooth (Foxconn) |
+
+Check your devices:
 ```bash
+lspci -nn | grep -i network
 lsusb | grep -iE "bluetooth|wireless"
 ```
 
 **Tested on:**
-- Fedora 43 (KDE Plasma), kernel 6.19.6
-- Should work on Fedora 41+, kernel 6.12+ (may need patch adjustments for older kernels)
+- Fedora 43 (KDE Plasma), kernel 6.19.6, ASUS ROG Strix X870-I Gaming WiFi
+- Should work on Fedora 41+, kernel 6.12+
 
 ## Quick Install
 
@@ -53,83 +57,96 @@ cd mt7927-bluetooth-fix
 sudo ./install.sh
 ```
 
-The script handles everything automatically:
-1. Installs build dependencies (`gcc`, `kernel-devel`)
-2. Downloads the matching kernel source and extracts the Bluetooth driver
-3. Applies the MT6639 patch to `btusb` and `btmtk`
-4. Compiles patched modules against your running kernel
-5. Downloads and extracts the MT6639 BT firmware from the ASUS driver package
-6. Installs modules and firmware, loads the driver, and activates Bluetooth
+The script handles everything:
+1. Installs build dependencies (`gcc`, `kernel-devel`, `dkms`)
+2. Downloads the matching kernel source
+3. Extracts and patches the `mt76` WiFi driver and `btusb`/`btmtk` Bluetooth drivers
+4. Builds and installs all modules via DKMS (survives kernel updates)
+5. Downloads and installs MT6639 WiFi + BT firmware from the official ASUS driver package
+6. Loads the drivers and activates WiFi and Bluetooth
+
+After installation, a **reboot** is recommended for clean module loading.
 
 ## After a Kernel Update
 
-When Fedora updates your kernel, the patched modules are replaced by the upstream versions. Re-run the installer:
+DKMS automatically rebuilds the modules when a new kernel is installed. If for some reason it doesn't work, re-run:
 
 ```bash
 cd mt7927-bluetooth-fix
 sudo ./install.sh
 ```
 
-This will rebuild and install the modules for the new kernel. The firmware only needs to be downloaded once.
-
 ## Uninstall
-
-To restore the original upstream modules:
 
 ```bash
 sudo ./uninstall.sh
 ```
 
+This removes the DKMS modules and firmware, restoring upstream drivers.
+
 ## How It Works
 
-The fix applies three changes to the kernel Bluetooth drivers:
+### WiFi — mt76/mt7925e patches (18 patches)
 
-### 1. btusb.c — Device ID registration
-Adds the MT7927 USB IDs to the `quirks_table` with the `BTUSB_MEDIATEK` flag, so `btusb_probe()` knows to use the MediaTek firmware loading path:
-```c
-{ USB_DEVICE(0x13d3, 0x3588), .driver_info = BTUSB_MEDIATEK |
-                                             BTUSB_WIDEBAND_SPEECH },
-```
+The `mt7925e` driver is patched to recognize the MT7927 chip ID (`0x6639` via PCIe) and load the correct firmware. Key changes:
+- Chip ID helpers to identify MT7927 hardware
+- Firmware paths and PCI ID registration for `14c3:6639`
+- CBTOP remap and chip initialization sequence
+- DMA ring, IRQ, and prefetch configuration
+- MCU initialization adjustments
+- Power management, DBDC, and CNM fixes
+- 320 MHz (WiFi 7) EHT capabilities support
+- ASPM disabled for stability
 
-### 2. btmtk.c — MT6639 chip support
-Adds the MT6639 device ID (`0x6639`) to the firmware loading logic:
-- Firmware filename generation for the MT6639 naming convention
-- Section filtering during firmware download (skips WiFi sections)
-- Firmware persistence detection to avoid re-download on soft resets
-- Hardware reset register support for the ConnectX v3 reset path
+### Bluetooth — btusb/btmtk patch
 
-### 3. MT6639 Bluetooth firmware
-The firmware (`BT_RAM_CODE_MT6639_2_1_hdr.bin`) is extracted from the official MediaTek Windows driver package distributed by ASUS. It is installed to `/lib/firmware/mediatek/mt6639/`.
+- Adds MT7927 USB IDs to `btusb` `quirks_table` with `BTUSB_MEDIATEK` flag
+- Adds MT6639 chip ID (`0x6639`) to `btmtk` firmware loading logic
+- Firmware section filtering (skips WiFi sections during BT firmware download)
+- Firmware persistence detection across soft resets
 
-## Upstream Status
+### Firmware
 
-As of March 2026, MT6639 Bluetooth support has **not** been merged into the mainline Linux kernel. Patches are being worked on and discussed on the linux-bluetooth mailing list. Once merged, this fix will no longer be necessary.
-
-Related upstream work:
-- [jetm/mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms) — DKMS package for both WiFi and BT (this project's patch is based on their BT patch)
-- [Kernel Bugzilla](https://bugzilla.kernel.org/) — Search for MT7927 or MT6639
+Extracted from the official MediaTek Windows driver package (distributed by ASUS):
+- `BT_RAM_CODE_MT6639_2_1_hdr.bin` → `/lib/firmware/mediatek/mt6639/`
+- `WIFI_MT6639_PATCH_MCU_2_1_hdr.bin` → `/lib/firmware/mediatek/mt7927/`
+- `WIFI_RAM_CODE_MT6639_2_1.bin` → `/lib/firmware/mediatek/mt7927/`
 
 ## Troubleshooting
 
-**"No known MT7927/MT6639 Bluetooth USB device found"**
-Your Bluetooth chip uses a different USB ID. Run `lsusb` and open an issue with the output.
-
-**Bluetooth powered on but cannot discover devices**
+**WiFi interface not appearing after install**
 ```bash
-bluetoothctl power off
+sudo modprobe mt7925e
+dmesg | grep mt7925
+```
+If you see firmware errors, check that `/lib/firmware/mediatek/mt7927/` contains the firmware files.
+
+**Bluetooth: "No default controller available"**
+```bash
+dmesg | grep -i bluetooth
+```
+The MT6639 firmware download takes ~15 seconds. Wait for "Device setup" in dmesg. Then:
+```bash
+sudo rfkill unblock bluetooth
 bluetoothctl power on
-bluetoothctl scan on
 ```
 
-**Module loads but no controller appears**
-Check `dmesg | grep -i bluetooth` for firmware loading errors. The firmware download takes ~15 seconds; wait for "Device setup" message.
+**After reboot, Bluetooth is off**
+Ensure `AutoEnable=true` in `/etc/bluetooth/main.conf` (set automatically by the installer).
 
-**After reboot, Bluetooth is off again**
-Ensure `AutoEnable=true` is set in `/etc/bluetooth/main.conf` (the installer sets this automatically).
+**WiFi connected but slow**
+Make sure the external antenna is properly screwed in on both SMA connectors.
+
+## Credits
+
+This project is based on the excellent work of [jetm/mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms), which provides the kernel patches and firmware extraction tools. This repository repackages it as a simpler one-command installer focused on Fedora.
+
+## Upstream Status
+
+As of March 2026, MT7927/MT6639 support has **not** been merged into the mainline Linux kernel. Once merged, this fix will no longer be necessary.
 
 ## License
 
-The install script and documentation are released under the MIT License.
+Install/uninstall scripts and documentation: MIT License.
 
-The kernel patch is derived from [mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms) and Linux kernel source code, both under GPL-2.0.
-The firmware extraction script is from the same project.
+Kernel patches, DKMS configuration, and firmware tools: derived from [mediatek-mt7927-dkms](https://github.com/jetm/mediatek-mt7927-dkms) and the Linux kernel, both GPL-2.0.
